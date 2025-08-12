@@ -73,3 +73,8 @@ def query_runs(athlete_id: int, start_iso: str, end_iso: str) -> list[Activity]:
                  Activity.start_date <= end)
         ).order_by(Activity.start_date.asc())
         return list(s.execute(stmt).scalars().all())
+def get_any_athlete_id() -> int | None:
+    from .models import Token
+    with SessionLocal() as s:
+        t = s.execute(select(Token)).scalars().first()
+        return t.athlete_id if t else None
