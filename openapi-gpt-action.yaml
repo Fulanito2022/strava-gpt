@@ -1,0 +1,78 @@
+openapi: 3.1.0
+info:
+  title: Strava GPT Backend
+  version: "1.0.0"
+servers:
+  - url: https://TU_BASE_URL
+paths:
+  /health:
+    get:
+      operationId: health
+      summary: Health check
+      responses:
+        "200": { description: ok }
+  /activities:
+    get:
+      operationId: getActivities
+      summary: Lista entrenos de running en un rango de fechas
+      parameters:
+        - in: query
+          name: start
+          required: true
+          schema: { type: string, example: "2025-06-01" }
+        - in: query
+          name: end
+          required: true
+          schema: { type: string, example: "2025-07-15" }
+      responses:
+        "200":
+          description: Lista de actividades
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    id: { type: integer }
+                    date: { type: string }
+                    name: { type: string }
+                    distance_km: { type: number }
+                    moving_time_min: { type: number }
+                    avg_hr: { type: integer, nullable: true }
+                    elev_gain_m: { type: integer }
+                    avg_pace: { type: string, nullable: true }
+  /stats/summary:
+    get:
+      operationId: getSummary
+      summary: Resumen de running para un rango de fechas
+      parameters:
+        - in: query
+          name: start
+          required: true
+          schema: { type: string, example: "2025-06-01" }
+        - in: query
+          name: end
+          required: true
+          schema: { type: string, example: "2025-07-15" }
+      responses:
+        "200":
+          description: Resumen con métricas clave
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sessions: { type: integer }
+                  distance_km: { type: number }
+                  moving_time_h: { type: number }
+                  elev_gain_m: { type: integer }
+                  avg_pace: { type: string }
+                  avg_hr: { type: integer, nullable: true }
+                  best_efforts:
+                    type: object
+                    properties:
+                      5k: { type: string, nullable: true }
+                      10k: { type: string, nullable: true }
+                      21k: { type: string, nullable: true }
+components: {}
