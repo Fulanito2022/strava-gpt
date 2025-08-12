@@ -1,3 +1,4 @@
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI, HTTPException, Request, Header
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel
@@ -9,6 +10,13 @@ from .stats import summarize_runs
 from . import auth as oauth
 
 app = FastAPI(title="Strava GPT Backend", version="1.0.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 app.include_router(oauth.router)
 
 ATHLETE_ID_SINGLETON: int | None = None  # para uso personal (1 atleta)
