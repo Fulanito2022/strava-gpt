@@ -1,203 +1,172 @@
 import os
-import json
-from datetime import datetime, timezone, date
-from typing import Optional, List
+from datetime import datetime, timezone
+from typing import Optional, Dict, Any
 
 from sqlalchemy import (
-    create_engine,
-    BigInteger,
-    String,
-    Text,
-    DateTime,
-    Integer,
-    Float,
-    select,
-    and_,
-    or_,
+    create_engine, Column, BigInteger, String, Integer, Float,
+    DateTime, JSON, select
 )
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, Session
-from dateutil.parser import isoparse
+from sqlalchemy.orm import sessionmaker, declarative_base, Session
 
-# DATABASE_URL debe ser del estilo:
-# postgresql+psycopg://USER:PASS@HOST/DB?sslmode=require&channel_binding=require
-DATABASE_URL = (
-    os.getenv("DATABASE_URL")
-    or os.getenv("DB_URL")
-    or os.getenv("DATABASE_URL".upper())
-)
-
+DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
-    raise RuntimeError("Falta DATABASE_URL en variables de entorno")
+    raise RuntimeError("DATABASE_URL no está definido")
 
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
-
-
-class Base(DeclarativeBase):
-    pass
+engine = create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+Base = declarative_base()
 
 
 class Token(Base):
     __tablename__ = "tokens"
-
-    # PK = athlete_id (de Strava). ¡Ojo! Es BIGINT.
-    athlete_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    access_token: Mapped[str] = mapped_column(String, nullable=False)
-    refresh_token: Mapped[str] = mapped_column(String, nullable=False)
-    # En tu BD existe como INTEGER (epoch). Lo mantenemos así para no migrar nada.
-    expires_at: Mapped[int] = mapped_column(Integer, nullable=False)
-    # Strava devuelve el scope como string "read,activity:read_all,profile:read_all"
-    scope: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    athlete_id = Column(BigInteger, primary_key=True)
+    access_token = Column(String, nullable=False)
+    refresh_token = Column(String, nullable=False)
+    scope = Column(String, nullable=True)
+    # La columna en Postgres es TIMESTAMP WITH TIME ZONE
+    expires_at = Column(DateTime(timezone=True), nullable=False)
 
 
 class Activity(Base):
     __tablename__ = "activities"
-
-    # IDs de Strava son grandes -> BIGINT
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    athlete_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
-
-    # sport/type y nombre
-    type: Mapped[str] = mapped_column(String(50), nullable=False)  # "Run", "TrailRun", etc.
-    name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
-
-    # fechas y métricas
-    start_date: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    distance_m: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    moving_time_s: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    elapsed_time_s: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    total_elevation_gain_m: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-
-    average_heartrate: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    max_heartrate: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-
-    # crudo (JSON) como texto
-    raw: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    id = Column(BigInteger, primary_key=True)
+    athlete_id = Column(BigInteger, index=True, nullable=False)
+    type = Column(String, nullable=True)
+    name = Column(String, nullable=True)
+    start_date = Column(DateTime(timezone=True), nullable=False)
+    distance_m = Column(Integer, nullable=True)
+    moving_time_s = Column(Integer, nullable=True)
+    elapsed_time_s = Column(Integer, nullable=True)
+    total_elevation_gain_m = Column(Integer, nullable=True)
+    average_heartrate = Column(Float, nullable=True)
+    max_heartrate = Column(Float, nullable=True)
+    # IMPORTANTE: JSON (no String) para que no lo castee a VARCHAR
+    raw = Column(JSON, nullable=False)
 
 
-# Crear tablas si no existen (no migra tipos existentes)
-Base.metadata.create_all(engine)
+def get_db() -> Session:
+    return SessionLocal()
 
 
-def _to_epoch_int(value) -> int:
-    """Convierte epoch (int/float) o datetime a epoch int (segundos)."""
-    if isinstance(value, (int, float)) and value > 0:
-        return int(value)
-    if isinstance(value, datetime):
-        if value.tzinfo is None:
-            value = value.replace(tzinfo=timezone.utc)
-        return int(value.timestamp())
-    raise ValueError("expires_at inválido")
+def get_any_athlete_id(db: Optional[Session] = None) -> Optional[int]:
+    close_after = False
+    if db is None:
+        db = get_db()
+        close_after = True
+    try:
+        res = db.execute(select(Token.athlete_id).limit(1)).first()
+        return res[0] if res else None
+    finally:
+        if close_after:
+            db.close()
+
+
+def get_token(athlete_id: int, db: Optional[Session] = None) -> Optional[Token]:
+    close_after = False
+    if db is None:
+        db = get_db()
+        close_after = True
+    try:
+        stmt = select(Token).where(Token.athlete_id == athlete_id).limit(1)
+        row = db.execute(stmt).scalar_one_or_none()
+        return row
+    finally:
+        if close_after:
+            db.close()
 
 
 def upsert_token(
+    *,
     athlete_id: int,
     access_token: str,
     refresh_token: str,
-    expires_at,  # int epoch o datetime
+    expires_at,  # puede venir como epoch(int) o datetime
     scope: Optional[str] = None,
+    db: Optional[Session] = None,
 ) -> None:
-    exp_int = _to_epoch_int(expires_at)
-    with Session(engine) as db:
-        tok = db.get(Token, athlete_id)
-        if tok:
-            tok.access_token = access_token
-            tok.refresh_token = refresh_token
-            tok.expires_at = exp_int
-            tok.scope = scope
+    close_after = False
+    if db is None:
+        db = get_db()
+        close_after = True
+
+    # Normaliza expires_at a datetime con tz
+    if isinstance(expires_at, (int, float)):
+        expires_dt = datetime.fromtimestamp(int(expires_at), tz=timezone.utc)
+    elif isinstance(expires_at, datetime):
+        expires_dt = expires_at.astimezone(timezone.utc)
+    else:
+        raise ValueError("expires_at debe ser int(epoch) o datetime")
+
+    try:
+        existing = db.get(Token, athlete_id)
+        if existing:
+            existing.access_token = access_token
+            existing.refresh_token = refresh_token
+            existing.expires_at = expires_dt
+            existing.scope = scope or existing.scope
         else:
             db.add(
                 Token(
                     athlete_id=athlete_id,
                     access_token=access_token,
                     refresh_token=refresh_token,
-                    expires_at=exp_int,
-                    scope=scope,
+                    expires_at=expires_dt,
+                    scope=scope or "",
                 )
             )
         db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        if close_after:
+            db.close()
 
 
-def get_token(athlete_id: int) -> Optional[Token]:
-    with Session(engine) as db:
-        return db.get(Token, athlete_id)
+def save_or_update_activity(activity: Dict[str, Any], db: Optional[Session] = None) -> None:
+    """
+    Recibe el dict que devuelve Strava y lo persiste.
+    `raw` se guarda como JSON (dict), NO como string.
+    """
+    from dateutil import parser as dtparser
 
+    close_after = False
+    if db is None:
+        db = get_db()
+        close_after = True
 
-def list_tokens() -> List[Token]:
-    with Session(engine) as db:
-        return list(db.scalars(select(Token)).all())
+    try:
+        act_id = int(activity["id"])
+        # start_date de Strava es ISO con Z -> tz-aware
+        start_dt = dtparser.parse(activity.get("start_date"))  # p.ej. "2024-09-27T17:23:20Z"
 
+        obj = db.get(Activity, act_id)
+        payload = {
+            "id": act_id,
+            "athlete_id": int(activity.get("athlete", {}).get("id") or activity.get("athlete_id")),
+            "type": activity.get("sport_type") or activity.get("type"),
+            "name": activity.get("name"),
+            "start_date": start_dt,
+            "distance_m": int(activity.get("distance", 0)) if activity.get("distance") is not None else None,
+            "moving_time_s": int(activity.get("moving_time", 0)) if activity.get("moving_time") is not None else None,
+            "elapsed_time_s": int(activity.get("elapsed_time", 0)) if activity.get("elapsed_time") is not None else None,
+            "total_elevation_gain_m": int(activity.get("total_elevation_gain", 0)) if activity.get("total_elevation_gain") is not None else None,
+            "average_heartrate": float(activity.get("average_heartrate")) if activity.get("average_heartrate") is not None else None,
+            "max_heartrate": float(activity.get("max_heartrate")) if activity.get("max_heartrate") is not None else None,
+            "raw": activity,  # <-- dict directo, SQLAlchemy lo serializa a JSON
+        }
 
-def save_or_update_activity(act: dict) -> None:
-    """Guarda/actualiza una actividad de Strava."""
-    act_id = int(act["id"])
-    athlete_id = int(
-        act.get("athlete", {}).get("id") or act.get("athlete_id") or 0
-    )
-    sport = act.get("sport_type") or act.get("type") or "Other"
-    name = act.get("name")
-    start_date_str = act.get("start_date") or act.get("start_date_local")
-    start_dt = isoparse(start_date_str) if start_date_str else datetime.now(timezone.utc)
-
-    distance_m = int(act.get("distance") or 0)
-    moving_time_s = int(act.get("moving_time") or 0)
-    elapsed_time_s = int(act.get("elapsed_time") or 0)
-    elev = int(round(float(act.get("total_elevation_gain") or 0)))
-
-    avg_hr = act.get("average_heartrate")
-    max_hr = act.get("max_heartrate")
-
-    raw_txt = json.dumps(act, ensure_ascii=False)
-
-    with Session(engine) as db:
-        row = db.get(Activity, act_id)
-        if row:
-            row.athlete_id = athlete_id or row.athlete_id
-            row.type = sport
-            row.name = name
-            row.start_date = start_dt
-            row.distance_m = distance_m
-            row.moving_time_s = moving_time_s
-            row.elapsed_time_s = elapsed_time_s
-            row.total_elevation_gain_m = elev
-            row.average_heartrate = avg_hr
-            row.max_heartrate = max_hr
-            row.raw = raw_txt
+        if obj:
+            for k, v in payload.items():
+                setattr(obj, k, v)
         else:
-            db.add(
-                Activity(
-                    id=act_id,
-                    athlete_id=athlete_id,
-                    type=sport,
-                    name=name,
-                    start_date=start_dt,
-                    distance_m=distance_m,
-                    moving_time_s=moving_time_s,
-                    elapsed_time_s=elapsed_time_s,
-                    total_elevation_gain_m=elev,
-                    average_heartrate=avg_hr,
-                    max_heartrate=max_hr,
-                    raw=raw_txt,
-                )
-            )
+            obj = Activity(**payload)
+            db.add(obj)
+
         db.commit()
-
-
-def query_runs(start: date, end: date) -> List[Activity]:
-    """Devuelve actividades de tipo running en [start, end] (ambos inclusive)."""
-    start_dt = datetime.combine(start, datetime.min.time(), tzinfo=timezone.utc)
-    end_dt = datetime.combine(end, datetime.max.time(), tzinfo=timezone.utc)
-
-    run_types = ("Run", "TrailRun")  # sport_type/type
-    with Session(engine) as db:
-        stmt = (
-            select(Activity)
-            .where(
-                and_(
-                    Activity.start_date >= start_dt,
-                    Activity.start_date <= end_dt,
-                    or_(Activity.type.in_(run_types), Activity.type.ilike("%Run%")),
-                )
-            )
-            .order_by(Activity.start_date.asc())
-        )
-        return list(db.scalars(stmt).all())
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        if close_after:
+            db.close()
