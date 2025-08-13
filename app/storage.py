@@ -43,8 +43,8 @@ class Token(Base):
     athlete_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     access_token: Mapped[str] = mapped_column(String, nullable=False)
     refresh_token: Mapped[str] = mapped_column(String, nullable=False)
-    # Guardamos como timestamptz en BD
-    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # En tu BD existe como INTEGER (epoch). Lo mantenemos así para no migrar nada.
+    expires_at: Mapped[int] = mapped_column(Integer, nullable=False)
     # Strava devuelve el scope como string "read,activity:read_all,profile:read_all"
     scope: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
@@ -74,16 +74,19 @@ class Activity(Base):
     raw: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
 
-# Crear tablas si no existen
+# Crear tablas si no existen (no migra tipos existentes)
 Base.metadata.create_all(engine)
 
 
-def _to_datetime_tz(value) -> datetime:
-    """Convierte epoch (int/float) o datetime a datetime con tz=UTC."""
+def _to_epoch_int(value) -> int:
+    """Convierte epoch (int/float) o datetime a epoch int (segundos)."""
+    if isinstance(value, (int, float)) and value > 0:
+        return int(value)
     if isinstance(value, datetime):
-        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
-    # value epoch en segundos
-    return datetime.fromtimestamp(float(value), tz=timezone.utc)
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return int(value.timestamp())
+    raise ValueError("expires_at inválido")
 
 
 def upsert_token(
@@ -93,13 +96,13 @@ def upsert_token(
     expires_at,  # int epoch o datetime
     scope: Optional[str] = None,
 ) -> None:
-    exp_dt = _to_datetime_tz(expires_at)
+    exp_int = _to_epoch_int(expires_at)
     with Session(engine) as db:
         tok = db.get(Token, athlete_id)
         if tok:
             tok.access_token = access_token
             tok.refresh_token = refresh_token
-            tok.expires_at = exp_dt
+            tok.expires_at = exp_int
             tok.scope = scope
         else:
             db.add(
@@ -107,7 +110,7 @@ def upsert_token(
                     athlete_id=athlete_id,
                     access_token=access_token,
                     refresh_token=refresh_token,
-                    expires_at=exp_dt,
+                    expires_at=exp_int,
                     scope=scope,
                 )
             )
@@ -126,7 +129,6 @@ def list_tokens() -> List[Token]:
 
 def save_or_update_activity(act: dict) -> None:
     """Guarda/actualiza una actividad de Strava."""
-    # Campos robustos (Strava usa sport_type en endpoints nuevos)
     act_id = int(act["id"])
     athlete_id = int(
         act.get("athlete", {}).get("id") or act.get("athlete_id") or 0
@@ -183,7 +185,6 @@ def save_or_update_activity(act: dict) -> None:
 def query_runs(start: date, end: date) -> List[Activity]:
     """Devuelve actividades de tipo running en [start, end] (ambos inclusive)."""
     start_dt = datetime.combine(start, datetime.min.time(), tzinfo=timezone.utc)
-    # sumar casi un día para incluir todo 'end'
     end_dt = datetime.combine(end, datetime.max.time(), tzinfo=timezone.utc)
 
     run_types = ("Run", "TrailRun")  # sport_type/type
