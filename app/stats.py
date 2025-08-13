@@ -41,7 +41,7 @@ def summarize_runs(runs: Iterable[Activity]):
     avg_hr = int(sum(hr_vals) / len(hr_vals)) if hr_vals else None
     avg_p = pace_per_km(movs, dist)
 
-    # Mejores parciales según "best_efforts" de Strava (si están en el detalle)
+    # Mejores parciales de Strava (si existen en el detalle)
     best = {"5k": None, "10k": None, "21k": None}
     for r in runs:
         if r.raw and isinstance(r.raw, dict):
@@ -74,7 +74,7 @@ def summarize_runs(runs: Iterable[Activity]):
     }
 
 def compare_runs(curr: Iterable[Activity], prev: Iterable[Activity]):
-    """Devuelve resumen de ambos periodos + diferencias y una recomendación breve."""
+    """Resumen de ambos periodos + diferencias y recomendación breve."""
     curr = list(curr); prev = list(prev)
 
     def totals(rs: list[Activity]):
@@ -92,7 +92,6 @@ def compare_runs(curr: Iterable[Activity], prev: Iterable[Activity]):
     current = summarize_runs(curr)
     previous = summarize_runs(prev)
 
-    # Deltas
     diff = {
         "sessions": current["sessions"] - previous["sessions"],
         "distance_km": round(current["distance_km"] - previous["distance_km"], 2),
@@ -101,7 +100,6 @@ def compare_runs(curr: Iterable[Activity], prev: Iterable[Activity]):
         "avg_pace_change_text": None,
         "avg_hr_change": None,
     }
-    # Ritmo: positivo = más rápido
     if c_pace_sec is not None and p_pace_sec is not None:
         sec = p_pace_sec - c_pace_sec
         tag = "más rápido" if sec > 0 else "más lento"
@@ -110,7 +108,6 @@ def compare_runs(curr: Iterable[Activity], prev: Iterable[Activity]):
     if c_hr is not None and p_hr is not None:
         diff["avg_hr_change"] = c_hr - p_hr
 
-    # Recomendación breve
     advice = []
     if p_dist > 0:
         vol_pct = (c_dist - p_dist) / p_dist * 100.0
