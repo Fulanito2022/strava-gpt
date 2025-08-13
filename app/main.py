@@ -1,120 +1,205 @@
-from fastapi import FastAPI, HTTPException, Request, Header
-from fastapi.responses import PlainTextResponse
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from dateutil import parser as dtp
-from datetime import timedelta
+import os
+import math
+from datetime import datetime, timedelta, date, timezone
+from typing import Optional, Dict, Any, List
 
-from .config import ADMIN_TOKEN, BASE_URL, STRAVA_CLIENT_ID, STRAVA_CLIENT_SECRET
-from . import auth as oauth
-from .stats import summarize_runs, compare_runs
-from .strava import exchange_code_for_token, ensure_fresh_token, list_activities, get_activity
-from .storage import upsert_token, get_token, save_or_update_activity, query_runs
+import httpx
+from fastapi import FastAPI, HTTPException, Query, Request, Header
+from fastapi.responses import RedirectResponse, JSONResponse
 
-# ---- helper para recuperar athlete tras reinicio ----
-try:
-    from .storage import get_any_athlete_id as storage_get_any_athlete_id
-except Exception:
-    storage_get_any_athlete_id = None
-    from sqlalchemy import select
-    from .storage import SessionLocal
-    from .models import Token
-    def _fallback_get_any_athlete_id() -> int | None:
-        with SessionLocal() as s:
-            t = s.execute(select(Token)).scalars().first()
-            return t.athlete_id if t else None
-
-app = FastAPI(title="Strava GPT Backend", version="1.0.0")
-
-# CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
+from .storage import (
+    upsert_token,
+    list_tokens,
+    query_runs,
+    save_or_update_activity,
+    Token,
 )
 
-# OAuth router
-app.include_router(oauth.router)
+APP_TITLE = "Strava GPT Backend"
+APP_VERSION = "1.0.0"
 
-ATHLETE_ID_SINGLETON: int | None = None
+app = FastAPI(title=APP_TITLE, version=APP_VERSION)
 
-def resolve_athlete_id() -> int | None:
-    global ATHLETE_ID_SINGLETON
-    if ATHLETE_ID_SINGLETON:
-        return ATHLETE_ID_SINGLETON
-    aid = None
-    if storage_get_any_athlete_id:
-        try:
-            aid = storage_get_any_athlete_id()
-        except Exception:
-            aid = None
-    else:
-        try:
-            aid = _fallback_get_any_athlete_id()
-        except Exception:
-            aid = None
-    if aid:
-        ATHLETE_ID_SINGLETON = aid
-        return aid
-    return None
+# === ENV VARS ===
+BASE_URL = os.getenv("BASE_URL") or os.getenv("RENDER_EXTERNAL_URL") or "http://localhost:8000"
+STRAVA_CLIENT_ID = os.getenv("STRAVA_CLIENT_ID")
+STRAVA_CLIENT_SECRET = os.getenv("STRAVA_CLIENT_SECRET")
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")  # para proteger /admin/*
 
-@app.get("/health")
+
+# === HELPERS ===
+def require_admin(authorization: Optional[str]) -> None:
+    if not ADMIN_TOKEN:
+        raise HTTPException(500, detail="Falta ADMIN_TOKEN en variables de entorno")
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(401, detail="Authorization Bearer requerido")
+    token = authorization.split(" ", 1)[1].strip()
+    if token != ADMIN_TOKEN:
+        raise HTTPException(403, detail="ADMIN_TOKEN inválido")
+
+
+def parse_ymd(s: str) -> date:
+    try:
+        return datetime.strptime(s, "%Y-%m-%d").date()
+    except Exception:
+        raise HTTPException(400, detail=f"Fecha inválida: {s}. Usa YYYY-MM-DD")
+
+
+def format_pace(moving_time_s: int, distance_m: int) -> Optional[str]:
+    if not distance_m or distance_m <= 0:
+        return None
+    sec_per_km = moving_time_s / (distance_m / 1000.0)
+    if not math.isfinite(sec_per_km) or sec_per_km <= 0:
+        return None
+    m = int(sec_per_km // 60)
+    s = int(round(sec_per_km % 60))
+    if s == 60:
+        m += 1
+        s = 0
+    return f"{m}:{s:02d} min/km"
+
+
+async def ensure_fresh_access_token(tok: Token) -> Token:
+    """Refresca el access_token si expiró."""
+    now = datetime.now(timezone.utc)
+    # margen de 60s
+    if tok.expires_at and tok.expires_at > (now + timedelta(seconds=60)):
+        return tok
+
+    if not STRAVA_CLIENT_ID or not STRAVA_CLIENT_SECRET:
+        raise HTTPException(500, detail="Faltan STRAVA_CLIENT_ID/STRAVA_CLIENT_SECRET")
+
+    data = {
+        "client_id": STRAVA_CLIENT_ID,
+        "client_secret": STRAVA_CLIENT_SECRET,
+        "grant_type": "refresh_token",
+        "refresh_token": tok.refresh_token,
+    }
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post("https://www.strava.com/api/v3/oauth/token", data=data)
+    if resp.status_code >= 400:
+        raise HTTPException(resp.status_code, detail=f"Strava refresh failed: {resp.text}")
+
+    payload = resp.json()
+    upsert_token(
+        athlete_id=tok.athlete_id,
+        access_token=payload["access_token"],
+        refresh_token=payload["refresh_token"],
+        expires_at=payload["expires_at"],  # epoch -> se convierte en storage
+        scope=payload.get("scope"),
+    )
+    # Devolvemos un objeto Token fresco releyendo desde BD sería lo ideal;
+    # aquí devolvemos un 'tok' actualizado ad hoc.
+    tok.access_token = payload["access_token"]
+    tok.refresh_token = payload["refresh_token"]
+    tok.expires_at = datetime.fromtimestamp(payload["expires_at"], tz=timezone.utc)
+    tok.scope = payload.get("scope")
+    return tok
+
+
+async def fetch_activities_since(tok: Token, after_epoch: int) -> int:
+    """Descarga y guarda actividades del atleta desde 'after_epoch' (segundos)."""
+    total = 0
+    page = 1
+    per_page = 200
+
+    tok = await ensure_fresh_access_token(tok)
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        while True:
+            params = {
+                "after": after_epoch,
+                "page": page,
+                "per_page": per_page,
+            }
+            headers = {"Authorization": f"Bearer {tok.access_token}"}
+            resp = await client.get(
+                "https://www.strava.com/api/v3/athlete/activities",
+                params=params,
+                headers=headers,
+            )
+            if resp.status_code >= 400:
+                raise HTTPException(resp.status_code, detail=f"Strava activities error: {resp.text}")
+
+            items = resp.json()
+            if not items:
+                break
+
+            for act in items:
+                # Guardamos todas, filtraremos por running al consultar
+                save_or_update_activity(act)
+                total += 1
+
+            if len(items) < per_page:
+                break
+            page += 1
+
+    return total
+
+
+# === ENDPOINTS ===
+
+@app.get("/health", summary="Health")
 def health():
-    return {"ok": True}
+    return {"ok": True, "version": APP_VERSION}
 
-from datetime import datetime, timezone
-from fastapi import HTTPException
-import httpx
-import os
 
-STRAVA_CLIENT_ID = os.environ.get("STRAVA_CLIENT_ID")
-STRAVA_CLIENT_SECRET = os.environ.get("STRAVA_CLIENT_SECRET")
+# -------- OAuth --------
 
-@app.get("/oauth/callback")
-async def oauth_callback(code: str | None = None, error: str | None = None):
-    # 1) Validaciones básicas
+@app.get("/oauth/start", tags=["oauth"], summary="Oauth Start")
+def oauth_start():
+    if not STRAVA_CLIENT_ID:
+        raise HTTPException(500, "Falta STRAVA_CLIENT_ID en variables de entorno")
+
+    # Debe coincidir EXACTAMENTE con lo configurado en Strava
+    redirect_uri = f"{BASE_URL}/oauth/callback"
+
+    params = {
+        "client_id": STRAVA_CLIENT_ID,
+        "response_type": "code",
+        "redirect_uri": redirect_uri,
+        "approval_prompt": "auto",
+        "scope": "read,activity:read_all,profile:read_all",
+    }
+    url = "https://www.strava.com/oauth/authorize?" + httpx.QueryParams(params).to_str()
+    return RedirectResponse(url)
+
+
+@app.get("/oauth/callback", summary="Oauth Callback")
+async def oauth_callback(
+    code: Optional[str] = Query(default=None),
+    error: Optional[str] = Query(default=None),
+):
     if error:
-        raise HTTPException(status_code=400, detail=f"OAuth error: {error}")
+        raise HTTPException(400, detail=error)
     if not code:
-        raise HTTPException(status_code=400, detail="Missing 'code'")
+        raise HTTPException(400, detail="Falta 'code' de Strava")
+    if not STRAVA_CLIENT_ID or not STRAVA_CLIENT_SECRET:
+        raise HTTPException(500, detail="Faltan STRAVA_CLIENT_ID/STRAVA_CLIENT_SECRET")
 
-    # 2) Intercambiar el code por tokens en Strava
-    token_url = "https://www.strava.com/oauth/token"
-    payload = {
-        "client_id": int(STRAVA_CLIENT_ID),
+    data = {
+        "client_id": STRAVA_CLIENT_ID,
         "client_secret": STRAVA_CLIENT_SECRET,
         "code": code,
         "grant_type": "authorization_code",
     }
 
-    async with httpx.AsyncClient(timeout=20) as client:
-        resp = await client.post(token_url, data=payload)
-        try:
-            resp.raise_for_status()
-        except httpx.HTTPStatusError as e:
-            # Esto evita que el 400 de Strava termine como 500 opaco
-            raise HTTPException(status_code=400, detail=f"Strava token error: {e.response.text}") from e
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post("https://www.strava.com/oauth/token", data=data)
 
-        data = resp.json()
+    if resp.status_code >= 400:
+        raise HTTPException(502, detail=f"Strava token exchange failed: {resp.text}")
 
-    # 3) Extraer campos necesarios
-    access_token = data.get("access_token")
-    refresh_token = data.get("refresh_token")
-    expires_at_unix = data.get("expires_at")
-    athlete = data.get("athlete") or {}
-    athlete_id = athlete.get("id")
-    scope = data.get("scope")  # opcional
+    payload = resp.json()
+    athlete_id = payload.get("athlete", {}).get("id")
+    access_token = payload.get("access_token")
+    refresh_token = payload.get("refresh_token")
+    expires_at = payload.get("expires_at")  # epoch
+    scope = payload.get("scope")
 
-    if not all([access_token, refresh_token, expires_at_unix, athlete_id]):
-        raise HTTPException(status_code=500, detail=f"Missing fields in Strava response: {data}")
+    if not (athlete_id and access_token and refresh_token and expires_at):
+        raise HTTPException(502, detail=f"Respuesta inválida de Strava: {payload}")
 
-    # 4) Convertir expires_at UNIX -> datetime con TZ
-    expires_at = datetime.fromtimestamp(int(expires_at_unix), tz=timezone.utc)
-
-    # 5) Guardar/actualizar token en BD
-    # asegúrate de que la firma de storage.upsert_token acepte scope opcional
     upsert_token(
         athlete_id=athlete_id,
         access_token=access_token,
@@ -123,165 +208,191 @@ async def oauth_callback(code: str | None = None, error: str | None = None):
         scope=scope,
     )
 
-    return {"detail": "Autorización correcta. Ya puedes usar el GPT."}
-
-# --- Admin: suscripción webhooks ---
-class SubReq(BaseModel):
-    verify_token: str = "verify"
-
-@app.post("/admin/subscribe")
-async def admin_subscribe(authorization: str = Header(None)):
-    if authorization != f"Bearer {ADMIN_TOKEN}":
-        raise HTTPException(401, "No autorizado")
-    import httpx
-    async with httpx.AsyncClient() as c:
-        r = await c.post("https://www.strava.com/api/v3/push_subscriptions", data={
-            "client_id": STRAVA_CLIENT_ID,
-            "client_secret": STRAVA_CLIENT_SECRET,
-            "callback_url": f"{BASE_URL}/strava/webhook",
-            "verify_token": "verify",
-        })
-        r.raise_for_status()
-        return r.json()
-
-from datetime import datetime, timezone
-import httpx
-
-@app.post("/admin/initial-import")
-async def initial_import(days: int = 365, authorization: str = Header(None)):
-    """
-    Importa actividades históricas desde Strava de los últimos 'days' días y las guarda en DB.
-    Solo RUN.
-    """
-    if authorization != f"Bearer {ADMIN_TOKEN}":
-        raise HTTPException(401, "No autorizado")
-
-    aid = resolve_athlete_id()
-    if not aid:
-        raise HTTPException(400, "Falta autorizar OAuth primero")
-
-    # Token fresco
-    tok = get_token(aid)
-    if not tok:
-        raise HTTPException(400, "Sin token para este atleta")
-    tok = await ensure_fresh_token(tok, upsert_token)
-
-    after_ts = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp())
-    saved = 0
-    page = 1
-    async with httpx.AsyncClient(timeout=30.0) as c:
-        while True:
-            r = await c.get(
-                "https://www.strava.com/api/v3/athlete/activities",
-                headers={"Authorization": f"Bearer {tok.access_token}"},
-                params={"after": after_ts, "per_page": 200, "page": page},
-            )
-            r.raise_for_status()
-            batch = r.json()
-            if not batch:
-                break
-            for act in batch:
-                if act.get("type") == "Run":
-                    # Si quieres mejores parciales, aquí podrías pedir el detalle completo
-                    # det = await c.get(f"https://www.strava.com/api/v3/activities/{act['id']}",
-                    #                  headers={"Authorization": f"Bearer {tok.access_token}"})
-                    # det.raise_for_status()
-                    # save_or_update_activity(det.json(), athlete_id=aid)
-                    save_or_update_activity(act, athlete_id=aid)
-                    saved += 1
-            page += 1
-
-    return {"imported": True, "count": saved, "days": days}
+    return JSONResponse({"detail": "Autorización correcta. Ya puedes usar el GPT.", "athlete_id": athlete_id})
 
 
-@app.get("/strava/webhook")
-async def strava_verify(request: Request):
-    qp = request.query_params
-    verify_token = qp.get("hub.verify_token") or qp.get("token")
-    challenge = qp.get("hub.challenge") or qp.get("challenge")
-    if verify_token != "verify":
-        raise HTTPException(403, "verify_token incorrecto")
-    return {"hub.challenge": challenge}
+# -------- Admin --------
 
-class Event(BaseModel):
-    object_type: str
-    object_id: int
-    aspect_type: str
-    owner_id: int
-    subscription_id: int | None = None
-    event_time: int | None = None
-    updates: dict | None = None
+@app.post("/admin/initial-import", summary="Initial Import")
+async def initial_import(
+    days: int = Query(default=365, ge=1, le=2000, description="Días atrás a importar"),
+    authorization: Optional[str] = Header(default=None),
+):
+    require_admin(authorization)
 
-@app.post("/strava/webhook")
-async def strava_event(ev: Event):
-    if ev.object_type != "activity":
-        return {"ignored": True}
-    token_row = get_token(ev.owner_id)
-    if not token_row:
-        return {"error": "Sin token para este atleta"}
-    token_row = await ensure_fresh_token(token_row, upsert_token)
-    act = await get_activity(token_row.access_token, ev.object_id)
-    if act.get("type") == "Run":
-        save_or_update_activity(act, athlete_id=ev.owner_id)
-    return {"ok": True}
+    toks = list_tokens()
+    if not toks:
+        raise HTTPException(400, detail="Falta autorizar OAuth primero")
 
-@app.get("/activities")
-async def activities(start: str, end: str):
-    """Lista actividades de running entre start y end (ISO YYYY-MM-DD)."""
-    aid = resolve_athlete_id()
-    if not aid:
-        raise HTTPException(400, "Falta autorizar OAuth primero")
-    s = dtp.isoparse(start).replace(tzinfo=None)
-    e = dtp.isoparse(end).replace(tzinfo=None)
-    runs = query_runs(aid, s.isoformat(), e.isoformat())
-    return [{
-        "id": r.id,
-        "date": r.start_date.isoformat(),
-        "name": r.name,
-        "distance_km": round(r.distance_m / 1000, 2),
-        "moving_time_min": round(r.moving_time_s / 60, 1),
-        "avg_hr": r.average_heartrate,
-        "elev_gain_m": r.total_elevation_gain_m,
-        "avg_pace": None,
-    } for r in runs]
+    after_epoch = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp())
+    results: Dict[int, int] = {}
+    for tok in toks:
+        count = await fetch_activities_since(tok, after_epoch)
+        results[tok.athlete_id] = count
 
-@app.get("/stats/summary")
-async def stats_summary(start: str, end: str):
-    aid = resolve_athlete_id()
-    if not aid:
-        raise HTTPException(400, "Falta autorizar OAuth primero")
-    s = dtp.isoparse(start).replace(tzinfo=None)
-    e = dtp.isoparse(end).replace(tzinfo=None)
-    runs = query_runs(aid, s.isoformat(), e.isoformat())
-    summary = summarize_runs(runs)
-    return summary
+    return {"imported": results, "since": after_epoch}
 
-# --- NUEVO: Comparativa ---
-@app.get("/stats/compare")
-async def stats_compare(start: str, end: str, prev_weeks: int | None = 4):
-    """Compara [start,end] con un periodo previo:
-    - prev_weeks=N => N*7 días antes de 'start'
-    - si prev_weeks es None/0 => mismo tamaño de ventana justo anterior
-    """
-    aid = resolve_athlete_id()
-    if not aid:
-        raise HTTPException(400, "Falta autorizar OAuth primero")
 
-    s = dtp.isoparse(start).replace(tzinfo=None)
-    e = dtp.isoparse(end).replace(tzinfo=None)
+@app.post("/admin/subscribe", summary="Admin Subscribe")
+def admin_subscribe(authorization: Optional[str] = Header(default=None)):
+    # Placeholder. La suscripción real requiere configurar webhook en Strava.
+    require_admin(authorization)
+    return {"detail": "OK (placeholder). Webhook no necesario para este flujo."}
 
+
+# -------- Webhook (opcional, placeholder) --------
+
+@app.get("/strava/webhook", summary="Strava Verify")
+def strava_verify(
+    hub_mode: Optional[str] = Query(alias="hub.mode", default=None),
+    hub_challenge: Optional[str] = Query(alias="hub.challenge", default=None),
+    hub_verify: Optional[str] = Query(alias="hub.verify_token", default=None),
+):
+    if hub_challenge:
+        return {"hub.challenge": hub_challenge}
+    return {"detail": "ok"}
+
+
+@app.post("/strava/webhook", summary="Strava Event")
+def strava_event(event: Dict[str, Any]):
+    # Solo registramos; la importación la hacemos bajo demanda.
+    return {"received": True}
+
+
+# -------- Datos de usuario --------
+
+@app.get(
+    "/activities",
+    summary="Activities",
+    description="Lista actividades de running entre start y end (ISO YYYY-MM-DD).",
+)
+def activities(
+    start: str = Query(...),
+    end: str = Query(...),
+):
+    d1 = parse_ymd(start)
+    d2 = parse_ymd(end)
+    if d2 < d1:
+        raise HTTPException(400, detail="end debe ser >= start")
+
+    runs = query_runs(d1, d2)
+    out: List[Dict[str, Any]] = []
+    for r in runs:
+        out.append(
+            {
+                "id": r.id,
+                "date": r.start_date.date().isoformat(),
+                "name": r.name,
+                "distance_km": round(r.distance_m / 1000.0, 2),
+                "moving_time_min": round(r.moving_time_s / 60.0, 1),
+                "avg_hr": round(r.average_heartrate, 0) if r.average_heartrate else None,
+                "elev_gain_m": r.total_elevation_gain_m,
+                "avg_pace": format_pace(r.moving_time_s, r.distance_m),
+            }
+        )
+    return out
+
+
+@app.get("/stats/summary", summary="Stats Summary")
+def stats_summary(
+    start: str = Query(...),
+    end: str = Query(...),
+):
+    d1 = parse_ymd(start)
+    d2 = parse_ymd(end)
+    if d2 < d1:
+        raise HTTPException(400, detail="end debe ser >= start")
+
+    runs = query_runs(d1, d2)
+    sessions = len(runs)
+    total_dist_m = sum(r.distance_m for r in runs)
+    total_time_s = sum(r.moving_time_s for r in runs)
+    total_elev = sum(r.total_elevation_gain_m for r in runs)
+    avg_hr_vals = [r.average_heartrate for r in runs if r.average_heartrate]
+
+    avg_pace = format_pace(total_time_s, total_dist_m) if total_dist_m > 0 else None
+    avg_hr = round(sum(avg_hr_vals) / len(avg_hr_vals)) if avg_hr_vals else None
+
+    # Best-efforts (simple: a nivel de carrera completa)
+    def best_time_for_dist(min_dist_m: int) -> Optional[str]:
+        eligible = [r for r in runs if r.distance_m >= min_dist_m and r.moving_time_s > 0]
+        if not eligible:
+            return None
+        best = min(eligible, key=lambda r: r.moving_time_s / (r.distance_m / min_dist_m))
+        # Escalado lineal aprox. a esa distancia (no es perfecto, pero orienta)
+        ratio = min_dist_m / best.distance_m
+        secs = int(best.moving_time_s * ratio)
+        m, s = secs // 60, secs % 60
+        return f"{m}:{s:02d}"
+
+    best = {
+        "5k": best_time_for_dist(5000),
+        "10k": best_time_for_dist(10000),
+        "21k": best_time_for_dist(21097),
+    }
+
+    return {
+        "sessions": sessions,
+        "distance_km": round(total_dist_m / 1000.0, 2),
+        "moving_time_h": round(total_time_s / 3600.0, 2),
+        "elev_gain_m": total_elev,
+        "avg_pace": avg_pace,
+        "avg_hr": avg_hr,
+        "best_efforts": best,
+    }
+
+
+@app.get(
+    "/stats/compare",
+    summary="Stats Compare",
+    description=(
+        "Compara [start,end] con un periodo previo:\n"
+        "- prev_weeks=N => N*7 días antes de 'start'\n"
+        "- si prev_weeks es None/0 => mismo tamaño de ventana justo anterior"
+    ),
+)
+def stats_compare(
+    start: str = Query(...),
+    end: str = Query(...),
+    prev_weeks: Optional[int] = Query(default=4),
+):
+    d1 = parse_ymd(start)
+    d2 = parse_ymd(end)
+    if d2 < d1:
+        raise HTTPException(400, detail="end debe ser >= start")
+
+    # Helper para reutilizar el summary
+    def summarize(d1: date, d2: date):
+        runs = query_runs(d1, d2)
+        sessions = len(runs)
+        total_dist_m = sum(r.distance_m for r in runs)
+        total_time_s = sum(r.moving_time_s for r in runs)
+        total_elev = sum(r.total_elevation_gain_m for r in runs)
+        avg_hr_vals = [r.average_heartrate for r in runs if r.average_heartrate]
+        return {
+            "sessions": sessions,
+            "distance_km": round(total_dist_m / 1000.0, 2),
+            "moving_time_h": round(total_time_s / 3600.0, 2),
+            "elev_gain_m": total_elev,
+            "avg_pace": format_pace(total_time_s, total_dist_m) if total_dist_m > 0 else None,
+            "avg_hr": round(sum(avg_hr_vals) / len(avg_hr_vals)) if avg_hr_vals else None,
+        }
+
+    # periodo previo
     if prev_weeks and prev_weeks > 0:
-        prev_start = s - timedelta(days=prev_weeks * 7)
-        prev_end = s - timedelta(seconds=1)
+        days = prev_weeks * 7
+        prev_end = d1 - timedelta(days=1)
+        prev_start = d1 - timedelta(days=days)
     else:
-        span = e - s
-        prev_start = s - span
-        prev_end = s - timedelta(seconds=1)
+        window = (d2 - d1).days + 1
+        prev_end = d1 - timedelta(days=1)
+        prev_start = prev_end - timedelta(days=window - 1)
 
-    curr_runs = query_runs(aid, s.isoformat(), e.isoformat())
-    prev_runs = query_runs(aid, prev_start.isoformat(), prev_end.isoformat())
+    current = summarize(d1, d2)
+    previous = summarize(prev_start, prev_end)
 
-    result = compare_runs(curr_runs, prev_runs)
-    result["current_range"] = {"start": s.isoformat(), "end": e.isoformat()}
-    result["previous_range"] = {"start": prev_start.isoformat(), "end": prev_end.isoformat()}
-    return result
+    return {
+        "current": current,
+        "previous": previous,
+        "previous_range": {"start": prev_start.isoformat(), "end": prev_end.isoformat()},
+    }
