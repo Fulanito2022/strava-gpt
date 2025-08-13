@@ -125,8 +125,8 @@ def upsert_token(
     athlete_id: int,
     access_token: str,
     refresh_token: str,
-    scope: Optional[str],
-    expires_at: int,
+    expires_at: datetime,
+    scope: str | None = None,
 ) -> None:
     """Inserta/actualiza el token de un atleta."""
     db: Session = SessionLocal()
