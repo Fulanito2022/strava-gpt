@@ -1,17 +1,19 @@
 import os
-import math
 from datetime import date, datetime, timezone, timedelta
 from typing import Optional, Dict, Any, List
 from urllib.parse import urlencode
-import sqlalchemy as sa
 
 import httpx
-from fastapi import FastAPI, Request, HTTPException
+import sqlalchemy as sa
+from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.responses import RedirectResponse, JSONResponse
 
 from .storage import (
-    get_db, get_token, upsert_token, save_or_update_activity,
-    get_any_athlete_id
+    get_db,
+    get_token,
+    upsert_token,
+    save_or_update_activity,
+    get_any_athlete_id,
 )
 
 app = FastAPI()
@@ -22,7 +24,15 @@ ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN")
 PUBLIC_URL = os.environ.get("PUBLIC_URL")  # p.ej. https://strava-gpt-xxxx.onrender.com
 
 if not (STRAVA_CLIENT_ID and STRAVA_CLIENT_SECRET and ADMIN_TOKEN):
-    raise RuntimeError("Faltan STRAVA_CLIENT_ID, STRAVA_CLIENT_SECRET o ADMIN_TOKEN en variables de entorno")
+    raise RuntimeError(
+        "Faltan STRAVA_CLIENT_ID, STRAVA_CLIENT_SECRET o ADMIN_TOKEN en variables de entorno"
+    )
+
+
+@app.get("/")
+def root():
+    return {"status": "ok", "app": "strava-gpt", "oauth_start": "/oauth/start"}
+
 
 def _base_url(request: Request) -> str:
     if PUBLIC_URL:
@@ -41,7 +51,7 @@ def oauth_start(request: Request):
         "approval_prompt": "auto",
         "scope": "read,activity:read_all,profile:read_all",
     }
-    # httpx.QueryParams(...): usa str(...) en vez de .to_str()
+    # Construimos la URL con urllib.parse.urlencode (no uses httpx.QueryParams.to_str)
     url = "https://www.strava.com/oauth/authorize?" + urlencode(params, doseq=True)
     return RedirectResponse(url, status_code=307)
 
@@ -73,17 +83,24 @@ def oauth_callback(request: Request, code: Optional[str] = None, error: Optional
     refresh_token = data["refresh_token"]
     # Strava da 'expires_at' en epoch (segundos)
     expires_at = int(data["expires_at"])
-    scope = ",".join(data.get("scope", [])) if isinstance(data.get("scope"), list) else (data.get("scope") or "")
+    scope = (
+        ",".join(data.get("scope", []))
+        if isinstance(data.get("scope"), list)
+        else (data.get("scope") or "")
+    )
 
+    # En storage.upsert_token conviertes el epoch a datetime con tz
     upsert_token(
         athlete_id=athlete_id,
         access_token=access_token,
         refresh_token=refresh_token,
-        expires_at=expires_at,  # lo convertimos a datetime en storage.upsert_token
+        expires_at=expires_at,
         scope=scope,
     )
 
-    return JSONResponse({"detail": "Autorización correcta. Ya puedes usar el GPT.", "athlete_id": athlete_id})
+    return JSONResponse(
+        {"detail": "Autorización correcta. Ya puedes usar el GPT.", "athlete_id": athlete_id}
+    )
 
 
 def _auth_admin_or_403(request: Request):
@@ -122,7 +139,10 @@ def _fetch_activities_since(access_token: str, after_epoch: int) -> int:
         page = 1
         per_page = 200
         while True:
-            resp = client.get("/athlete/activities", params={"after": after_epoch, "page": page, "per_page": per_page})
+            resp = client.get(
+                "/athlete/activities",
+                params={"after": after_epoch, "page": page, "per_page": per_page},
+            )
             resp.raise_for_status()
             items: List[Dict[str, Any]] = resp.json()
             if not items:
@@ -155,36 +175,50 @@ async def initial_import(request: Request, days: int = 365, athlete_id: Optional
 
 @app.get("/activities")
 def list_activities(start: str, end: str, db=Depends(get_db)):
-    start_d = date.fromisoformat(start)                 # p.ej. 2025-05-01
-    end_excl = date.fromisoformat(end) + timedelta(days=1)  # 2025-08-14
+    """
+    Devuelve actividades entre start y end (inclusive), usando límites UTC.
+    start/end en formato YYYY-MM-DD.
+    """
+    d0 = date.fromisoformat(start)
+    d1 = date.fromisoformat(end) + timedelta(days=1)  # límite exclusivo
+    start_dt = datetime(d0.year, d0.month, d0.day, tzinfo=timezone.utc)
+    end_excl = datetime(d1.year, d1.month, d1.day, tzinfo=timezone.utc)
 
-    q = sa.text("""
+    q = sa.text(
+        """
         SELECT id, athlete_id, type, name, start_date, distance_m, moving_time_s, elapsed_time_s,
                total_elevation_gain_m, average_heartrate, max_heartrate
         FROM activities
         WHERE start_date >= :start AND start_date < :end
         ORDER BY start_date DESC
-    """)
+        """
+    )
 
-    rows = db.execute(q, {"start": start_d, "end": end_excl}).mappings().all()
+    rows = db.execute(q, {"start": start_dt, "end": end_excl}).mappings().all()
     return rows
 
 
 @app.get("/stats/summary")
-def stats_summary(start: str, end: str):
-    from sqlalchemy import text
-    db = get_db()
-    try:
-        q = text("""
-            SELECT
-              COUNT(*) AS n,
-              COALESCE(SUM(distance_m),0) AS dist_m,
-              COALESCE(SUM(moving_time_s),0) AS time_s,
-              COALESCE(SUM(total_elevation_gain_m),0) AS elev_m
-            FROM activities
-            WHERE start_date >= :start::timestamptz AND start_date < (:end::date + INTERVAL '1 day')
-        """)
-        row = db.execute(q, {"start": start, "end": end}).mappings().first()
-        return row
-    finally:
-        db.close()
+def stats_summary(start: str, end: str, db=Depends(get_db)):
+    """
+    Suma total de distancia, tiempo y desnivel entre start y end (inclusive).
+    start/end en formato YYYY-MM-DD.
+    """
+    d0 = date.fromisoformat(start)
+    d1 = date.fromisoformat(end) + timedelta(days=1)  # límite exclusivo
+    start_dt = datetime(d0.year, d0.month, d0.day, tzinfo=timezone.utc)
+    end_excl = datetime(d1.year, d1.month, d1.day, tzinfo=timezone.utc)
+
+    q = sa.text(
+        """
+        SELECT
+          COUNT(*) AS n,
+          COALESCE(SUM(distance_m), 0) AS dist_m,
+          COALESCE(SUM(moving_time_s), 0) AS time_s,
+          COALESCE(SUM(total_elevation_gain_m), 0) AS elev_m
+        FROM activities
+        WHERE start_date >= :start AND start_date < :end
+        """
+    )
+    row = db.execute(q, {"start": start_dt, "end": end_excl}).mappings().first()
+    return row or {"n": 0, "dist_m": 0, "time_s": 0, "elev_m": 0}
