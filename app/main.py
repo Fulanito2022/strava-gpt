@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, date, timezone
 from typing import Optional, Dict, Any, List
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query, Request, Header
+from fastapi import FastAPI, HTTPException, Query, Header
 from fastapi.responses import RedirectResponse, JSONResponse
 
 from .storage import (
@@ -60,10 +60,9 @@ def format_pace(moving_time_s: int, distance_m: int) -> Optional[str]:
 
 
 async def ensure_fresh_access_token(tok: Token) -> Token:
-    """Refresca el access_token si expiró."""
-    now = datetime.now(timezone.utc)
-    # margen de 60s
-    if tok.expires_at and tok.expires_at > (now + timedelta(seconds=60)):
+    """Refresca el access_token si expiró. tok.expires_at es epoch (int)."""
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    if tok.expires_at and tok.expires_at > (now_ts + 60):
         return tok
 
     if not STRAVA_CLIENT_ID or not STRAVA_CLIENT_SECRET:
@@ -85,14 +84,12 @@ async def ensure_fresh_access_token(tok: Token) -> Token:
         athlete_id=tok.athlete_id,
         access_token=payload["access_token"],
         refresh_token=payload["refresh_token"],
-        expires_at=payload["expires_at"],  # epoch -> se convierte en storage
+        expires_at=payload["expires_at"],  # epoch int
         scope=payload.get("scope"),
     )
-    # Devolvemos un objeto Token fresco releyendo desde BD sería lo ideal;
-    # aquí devolvemos un 'tok' actualizado ad hoc.
     tok.access_token = payload["access_token"]
     tok.refresh_token = payload["refresh_token"]
-    tok.expires_at = datetime.fromtimestamp(payload["expires_at"], tz=timezone.utc)
+    tok.expires_at = int(payload["expires_at"])
     tok.scope = payload.get("scope")
     return tok
 
@@ -107,11 +104,7 @@ async def fetch_activities_since(tok: Token, after_epoch: int) -> int:
 
     async with httpx.AsyncClient(timeout=60) as client:
         while True:
-            params = {
-                "after": after_epoch,
-                "page": page,
-                "per_page": per_page,
-            }
+            params = {"after": after_epoch, "page": page, "per_page": per_page}
             headers = {"Authorization": f"Bearer {tok.access_token}"}
             resp = await client.get(
                 "https://www.strava.com/api/v3/athlete/activities",
@@ -126,7 +119,6 @@ async def fetch_activities_since(tok: Token, after_epoch: int) -> int:
                 break
 
             for act in items:
-                # Guardamos todas, filtraremos por running al consultar
                 save_or_update_activity(act)
                 total += 1
 
@@ -151,7 +143,6 @@ def oauth_start():
     if not STRAVA_CLIENT_ID:
         raise HTTPException(500, "Falta STRAVA_CLIENT_ID en variables de entorno")
 
-    # Debe coincidir EXACTAMENTE con lo configurado en Strava
     redirect_uri = f"{BASE_URL}/oauth/callback"
 
     params = {
@@ -185,7 +176,7 @@ async def oauth_callback(
     }
 
     async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post("https://www.strava.com/oauth/token", data=data)
+        resp = await client.post("https://www.strava.com/api/v3/oauth/token", data=data)
 
     if resp.status_code >= 400:
         raise HTTPException(502, detail=f"Strava token exchange failed: {resp.text}")
@@ -194,8 +185,8 @@ async def oauth_callback(
     athlete_id = payload.get("athlete", {}).get("id")
     access_token = payload.get("access_token")
     refresh_token = payload.get("refresh_token")
-    expires_at = payload.get("expires_at")  # epoch
-    scope = payload.get("scope")
+    expires_at = payload.get("expires_at")  # epoch (int)
+    scope = payload.get("scope", "")
 
     if not (athlete_id and access_token and refresh_token and expires_at):
         raise HTTPException(502, detail=f"Respuesta inválida de Strava: {payload}")
@@ -235,7 +226,6 @@ async def initial_import(
 
 @app.post("/admin/subscribe", summary="Admin Subscribe")
 def admin_subscribe(authorization: Optional[str] = Header(default=None)):
-    # Placeholder. La suscripción real requiere configurar webhook en Strava.
     require_admin(authorization)
     return {"detail": "OK (placeholder). Webhook no necesario para este flujo."}
 
@@ -255,7 +245,6 @@ def strava_verify(
 
 @app.post("/strava/webhook", summary="Strava Event")
 def strava_event(event: Dict[str, Any]):
-    # Solo registramos; la importación la hacemos bajo demanda.
     return {"received": True}
 
 
@@ -313,23 +302,17 @@ def stats_summary(
     avg_pace = format_pace(total_time_s, total_dist_m) if total_dist_m > 0 else None
     avg_hr = round(sum(avg_hr_vals) / len(avg_hr_vals)) if avg_hr_vals else None
 
-    # Best-efforts (simple: a nivel de carrera completa)
     def best_time_for_dist(min_dist_m: int) -> Optional[str]:
         eligible = [r for r in runs if r.distance_m >= min_dist_m and r.moving_time_s > 0]
         if not eligible:
             return None
         best = min(eligible, key=lambda r: r.moving_time_s / (r.distance_m / min_dist_m))
-        # Escalado lineal aprox. a esa distancia (no es perfecto, pero orienta)
         ratio = min_dist_m / best.distance_m
         secs = int(best.moving_time_s * ratio)
         m, s = secs // 60, secs % 60
         return f"{m}:{s:02d}"
 
-    best = {
-        "5k": best_time_for_dist(5000),
-        "10k": best_time_for_dist(10000),
-        "21k": best_time_for_dist(21097),
-    }
+    best = {"5k": best_time_for_dist(5000), "10k": best_time_for_dist(10000), "21k": best_time_for_dist(21097)}
 
     return {
         "sessions": sessions,
@@ -361,7 +344,6 @@ def stats_compare(
     if d2 < d1:
         raise HTTPException(400, detail="end debe ser >= start")
 
-    # Helper para reutilizar el summary
     def summarize(d1: date, d2: date):
         runs = query_runs(d1, d2)
         sessions = len(runs)
@@ -378,7 +360,6 @@ def stats_compare(
             "avg_hr": round(sum(avg_hr_vals) / len(avg_hr_vals)) if avg_hr_vals else None,
         }
 
-    # periodo previo
     if prev_weeks and prev_weeks > 0:
         days = prev_weeks * 7
         prev_end = d1 - timedelta(days=1)
