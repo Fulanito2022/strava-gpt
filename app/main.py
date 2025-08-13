@@ -99,6 +99,56 @@ async def admin_subscribe(authorization: str = Header(None)):
         r.raise_for_status()
         return r.json()
 
+from datetime import datetime, timezone
+import httpx
+
+@app.post("/admin/initial-import")
+async def initial_import(days: int = 365, authorization: str = Header(None)):
+    """
+    Importa actividades históricas desde Strava de los últimos 'days' días y las guarda en DB.
+    Solo RUN.
+    """
+    if authorization != f"Bearer {ADMIN_TOKEN}":
+        raise HTTPException(401, "No autorizado")
+
+    aid = resolve_athlete_id()
+    if not aid:
+        raise HTTPException(400, "Falta autorizar OAuth primero")
+
+    # Token fresco
+    tok = get_token(aid)
+    if not tok:
+        raise HTTPException(400, "Sin token para este atleta")
+    tok = await ensure_fresh_token(tok, upsert_token)
+
+    after_ts = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp())
+    saved = 0
+    page = 1
+    async with httpx.AsyncClient(timeout=30.0) as c:
+        while True:
+            r = await c.get(
+                "https://www.strava.com/api/v3/athlete/activities",
+                headers={"Authorization": f"Bearer {tok.access_token}"},
+                params={"after": after_ts, "per_page": 200, "page": page},
+            )
+            r.raise_for_status()
+            batch = r.json()
+            if not batch:
+                break
+            for act in batch:
+                if act.get("type") == "Run":
+                    # Si quieres mejores parciales, aquí podrías pedir el detalle completo
+                    # det = await c.get(f"https://www.strava.com/api/v3/activities/{act['id']}",
+                    #                  headers={"Authorization": f"Bearer {tok.access_token}"})
+                    # det.raise_for_status()
+                    # save_or_update_activity(det.json(), athlete_id=aid)
+                    save_or_update_activity(act, athlete_id=aid)
+                    saved += 1
+            page += 1
+
+    return {"imported": True, "count": saved, "days": days}
+
+
 @app.get("/strava/webhook")
 async def strava_verify(request: Request):
     qp = request.query_params
