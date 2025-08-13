@@ -1,8 +1,9 @@
 import os
 import math
-from datetime import datetime, timezone, timedelta
+from datetime import date, datetime, timezone, timedelta
 from typing import Optional, Dict, Any, List
 from urllib.parse import urlencode
+import sqlalchemy as sa
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException
@@ -153,24 +154,20 @@ async def initial_import(request: Request, days: int = 365, athlete_id: Optional
 
 
 @app.get("/activities")
-def list_activities(start: str, end: str):
-    """
-    start/end: YYYY-MM-DD (UTC)
-    """
-    from sqlalchemy import text
-    db = get_db()
-    try:
-        q = text("""
-            SELECT id, athlete_id, type, name, start_date, distance_m, moving_time_s, elapsed_time_s,
-                   total_elevation_gain_m, average_heartrate, max_heartrate
-            FROM activities
-            WHERE start_date >= :start::timestamptz AND start_date < (:end::date + INTERVAL '1 day')
-            ORDER BY start_date DESC
-        """)
-        rows = db.execute(q, {"start": start, "end": end}).mappings().all()
-        return {"count": len(rows), "activities": list(rows)}
-    finally:
-        db.close()
+def list_activities(start: str, end: str, db=Depends(get_db)):
+    start_d = date.fromisoformat(start)                 # p.ej. 2025-05-01
+    end_excl = date.fromisoformat(end) + timedelta(days=1)  # 2025-08-14
+
+    q = sa.text("""
+        SELECT id, athlete_id, type, name, start_date, distance_m, moving_time_s, elapsed_time_s,
+               total_elevation_gain_m, average_heartrate, max_heartrate
+        FROM activities
+        WHERE start_date >= :start AND start_date < :end
+        ORDER BY start_date DESC
+    """)
+
+    rows = db.execute(q, {"start": start_d, "end": end_excl}).mappings().all()
+    return rows
 
 
 @app.get("/stats/summary")
