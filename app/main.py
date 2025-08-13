@@ -64,21 +64,66 @@ def resolve_athlete_id() -> int | None:
 def health():
     return {"ok": True}
 
+from datetime import datetime, timezone
+from fastapi import HTTPException
+import httpx
+import os
+
+STRAVA_CLIENT_ID = os.environ.get("STRAVA_CLIENT_ID")
+STRAVA_CLIENT_SECRET = os.environ.get("STRAVA_CLIENT_SECRET")
+
 @app.get("/oauth/callback")
 async def oauth_callback(code: str | None = None, error: str | None = None):
+    # 1) Validaciones básicas
     if error:
-        raise HTTPException(400, f"OAuth error: {error}")
+        raise HTTPException(status_code=400, detail=f"OAuth error: {error}")
     if not code:
-        raise HTTPException(400, "Falta code")
-    data = await exchange_code_for_token(code)
-    access_token = data["access_token"]
-    refresh_token = data["refresh_token"]
-    expires_at = int(data["expires_at"])
-    athlete_id = data["athlete"]["id"]
-    upsert_token(athlete_id, access_token, refresh_token, expires_at)
-    global ATHLETE_ID_SINGLETON
-    ATHLETE_ID_SINGLETON = athlete_id
-    return PlainTextResponse("Autorización correcta. Ya puedes usar el GPT.")
+        raise HTTPException(status_code=400, detail="Missing 'code'")
+
+    # 2) Intercambiar el code por tokens en Strava
+    token_url = "https://www.strava.com/oauth/token"
+    payload = {
+        "client_id": int(STRAVA_CLIENT_ID),
+        "client_secret": STRAVA_CLIENT_SECRET,
+        "code": code,
+        "grant_type": "authorization_code",
+    }
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.post(token_url, data=payload)
+        try:
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            # Esto evita que el 400 de Strava termine como 500 opaco
+            raise HTTPException(status_code=400, detail=f"Strava token error: {e.response.text}") from e
+
+        data = resp.json()
+
+    # 3) Extraer campos necesarios
+    access_token = data.get("access_token")
+    refresh_token = data.get("refresh_token")
+    expires_at_unix = data.get("expires_at")
+    athlete = data.get("athlete") or {}
+    athlete_id = athlete.get("id")
+    scope = data.get("scope")  # opcional
+
+    if not all([access_token, refresh_token, expires_at_unix, athlete_id]):
+        raise HTTPException(status_code=500, detail=f"Missing fields in Strava response: {data}")
+
+    # 4) Convertir expires_at UNIX -> datetime con TZ
+    expires_at = datetime.fromtimestamp(int(expires_at_unix), tz=timezone.utc)
+
+    # 5) Guardar/actualizar token en BD
+    # asegúrate de que la firma de storage.upsert_token acepte scope opcional
+    upsert_token(
+        athlete_id=athlete_id,
+        access_token=access_token,
+        refresh_token=refresh_token,
+        expires_at=expires_at,
+        scope=scope,
+    )
+
+    return {"detail": "Autorización correcta. Ya puedes usar el GPT."}
 
 # --- Admin: suscripción webhooks ---
 class SubReq(BaseModel):
