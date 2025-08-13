@@ -138,6 +138,8 @@ def health():
 
 # -------- OAuth --------
 
+from urllib.parse import urlencode
+
 @app.get("/oauth/start", tags=["oauth"], summary="Oauth Start")
 def oauth_start():
     if not STRAVA_CLIENT_ID:
@@ -152,7 +154,7 @@ def oauth_start():
         "approval_prompt": "auto",
         "scope": "read,activity:read_all,profile:read_all",
     }
-    url = "https://www.strava.com/oauth/authorize?" + httpx.QueryParams(params).to_str()
+    url = "https://www.strava.com/oauth/authorize?" + urlencode(params)
     return RedirectResponse(url)
 
 
