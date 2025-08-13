@@ -11,7 +11,7 @@ from .stats import summarize_runs, compare_runs
 from .strava import exchange_code_for_token, ensure_fresh_token, list_activities, get_activity
 from .storage import upsert_token, get_token, save_or_update_activity, query_runs
 
-# ---- intento de helper opcional (recuperar athlete tras reinicio) ----
+# ---- helper para recuperar athlete tras reinicio ----
 try:
     from .storage import get_any_athlete_id as storage_get_any_athlete_id
 except Exception:
@@ -26,7 +26,7 @@ except Exception:
 
 app = FastAPI(title="Strava GPT Backend", version="1.0.0")
 
-# CORS para poder usar Hoppscotch/Postman web
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -80,7 +80,7 @@ async def oauth_callback(code: str | None = None, error: str | None = None):
     ATHLETE_ID_SINGLETON = athlete_id
     return PlainTextResponse("Autorización correcta. Ya puedes usar el GPT.")
 
-# --- Admin: crear suscripción webhook (llámalo una vez) ---
+# --- Admin: suscripción webhooks ---
 class SubReq(BaseModel):
     verify_token: str = "verify"
 
@@ -99,7 +99,6 @@ async def admin_subscribe(authorization: str = Header(None)):
         r.raise_for_status()
         return r.json()
 
-# --- Webhook verification ---
 @app.get("/strava/webhook")
 async def strava_verify(request: Request):
     qp = request.query_params
@@ -109,7 +108,6 @@ async def strava_verify(request: Request):
         raise HTTPException(403, "verify_token incorrecto")
     return {"hub.challenge": challenge}
 
-# --- Webhook events ---
 class Event(BaseModel):
     object_type: str
     object_id: int
@@ -132,7 +130,6 @@ async def strava_event(ev: Event):
         save_or_update_activity(act, athlete_id=ev.owner_id)
     return {"ok": True}
 
-# --- Lista de actividades por fechas ---
 @app.get("/activities")
 async def activities(start: str, end: str):
     """Lista actividades de running entre start y end (ISO YYYY-MM-DD)."""
@@ -153,7 +150,6 @@ async def activities(start: str, end: str):
         "avg_pace": None,
     } for r in runs]
 
-# --- Resumen por fechas ---
 @app.get("/stats/summary")
 async def stats_summary(start: str, end: str):
     aid = resolve_athlete_id()
