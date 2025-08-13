@@ -6,9 +6,11 @@ from dateutil import parser as dtp
 
 from .config import ADMIN_TOKEN, BASE_URL, STRAVA_CLIENT_ID, STRAVA_CLIENT_SECRET
 from . import auth as oauth
-from .stats import summarize_runs
+from .stats import summarize_runs, compare_runs
 from .strava import exchange_code_for_token, ensure_fresh_token, list_activities, get_activity
 from .storage import upsert_token, get_token, save_or_update_activity, query_runs
+from datetime import timedelta  
+
 
 # ---- intentamos importar helper opcional; si no existe, definimos fallback ----
 try:
@@ -192,6 +194,35 @@ async def stats_summary(start: str, end: str):
     runs = query_runs(aid, s.isoformat(), e.isoformat())
     summary = summarize_runs(runs)
     return summary
+
+@app.get("/stats/compare")
+async def stats_compare(start: str, end: str, prev_weeks: int | None = 4):
+    """Compara el rango [start,end] con un rango previo.
+    - Si prev_weeks está definido: compara con las prev_weeks*7 días justo antes de 'start'.
+    - Si no: compara con un rango de la MISMA longitud justo anterior.
+    """
+    aid = resolve_athlete_id()
+    if not aid:
+        raise HTTPException(400, "Falta autorizar OAuth primero")
+
+    s = dtp.isoparse(start).replace(tzinfo=None)
+    e = dtp.isoparse(end).replace(tzinfo=None)
+
+    if prev_weeks and prev_weeks > 0:
+        prev_start = s - timedelta(days=prev_weeks * 7)
+        prev_end = s - timedelta(seconds=1)
+    else:
+        span = e - s
+        prev_start = s - span
+        prev_end = s - timedelta(seconds=1)
+
+    curr_runs = query_runs(aid, s.isoformat(), e.isoformat())
+    prev_runs = query_runs(aid, prev_start.isoformat(), prev_end.isoformat())
+
+    result = compare_runs(curr_runs, prev_runs)
+    result["current_range"] = {"start": s.isoformat(), "end": e.isoformat()}
+    result["previous_range"] = {"start": prev_start.isoformat(), "end": prev_end.isoformat()}
+    return result
 
 
 # --- Utilidad: import inicial (pull) para poblar la DB sin esperar webhooks ---
