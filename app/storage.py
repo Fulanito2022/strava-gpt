@@ -3,11 +3,24 @@ from sqlalchemy.orm import sessionmaker
 from .models import Base, Token, Activity
 from .config import DATABASE_URL
 
-engine = create_engine(DATABASE_URL, future=True)
+# Crea el engine con sane defaults para Postgres y SQLite
+connect_args = {}
+if DATABASE_URL.startswith("sqlite"):
+    # Evita problemas de threads en SQLite local
+    connect_args = {"check_same_thread": False}
+
+engine = create_engine(
+    DATABASE_URL,
+    future=True,
+    pool_pre_ping=True,
+    connect_args=connect_args
+)
+
 SessionLocal = sessionmaker(engine, expire_on_commit=False, future=True)
 
 # Inicializa tablas
 Base.metadata.create_all(engine)
+
 
 def upsert_token(athlete_id: int, access_token: str, refresh_token: str, expires_at: int):
     with SessionLocal() as s:
