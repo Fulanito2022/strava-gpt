@@ -1,15 +1,27 @@
 import os
 from datetime import date, datetime, timezone, timedelta
 
-def _as_utc(dt: datetime) -> datetime:
-    """Devuelve dt con tz=UTC (si viene naive le pone UTC)."""
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
+def _to_utc_datetime(value) -> datetime:
+    """Acepta datetime/int/float/str (ISO/epoch) y devuelve datetime con tz=UTC."""
+    if value is None:
+        raise ValueError("datetime requerido")
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(float(value), tz=timezone.utc)
+    if isinstance(value, str):
+        # admite ISO y 'Z'
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
+    raise TypeError(f"Tipo no soportado para fecha: {type(value)}")
 
-def _epoch_s(dt: datetime) -> int:
-    """Epoch seconds de un datetime (lo fuerza a UTC)."""
-    return int(_as_utc(dt).timestamp())
+def _as_utc(dt: datetime) -> datetime:
+    """Normaliza a datetime con tz=UTC (también si viene como epoch/str)."""
+    return _to_utc_datetime(dt)
+
+def _epoch_s(dt) -> int:
+    """Epoch seconds a partir de datetime/int/str, forzando UTC."""
+    return int(_to_utc_datetime(dt).timestamp())
+
 
 from typing import Optional, Dict, Any, List
 from urllib.parse import urlencode
@@ -145,12 +157,12 @@ def _ensure_valid_access_token(athlete_id: int) -> str:
         raise HTTPException(status_code=404, detail=f"No hay token para athlete_id={athlete_id}")
 
     now_s = int(datetime.now(timezone.utc).timestamp())
-    expires_s = _epoch_s(tok.expires_at)  # <-- robusto a naive
-    # refresca si faltan <= 60s
+    expires_s = _epoch_s(tok.expires_at)  # <- ahora acepta int/datetime/str
     if expires_s <= now_s + 60:
         _do_refresh(athlete_id)
         tok = get_token(athlete_id)
     return tok.access_token
+
 
 
 @app.get("/admin/health")
@@ -184,9 +196,10 @@ def token_info(request: Request, athlete_id: Optional[int] = None):
         "expires_at_iso": exp_utc.isoformat(),
         "seconds_left": int((exp_utc - now_utc).total_seconds()),
         "is_expired": exp_utc <= now_utc,
-        "access_token_tail": tok.access_token[-6:],
+        "access_token_tail": (tok.access_token or "")[-6:],
         "scope": tok.scope or "",
     }
+
 
 
 
@@ -247,7 +260,7 @@ def initial_import(request: Request, days: int = 365, athlete_id: Optional[int] 
 # ---------- Consultas de datos ----------
 @app.get("/activities")
 def list_activities(start: str, end: str, db=Depends(get_db)):
-    start_d = date.fromisoformat(start)                 # p.ej. 2025-05-01
+    start_d = date.fromisoformat(start)
     end_excl = date.fromisoformat(end) + timedelta(days=1)
 
     q = sa.text("""
@@ -257,27 +270,28 @@ def list_activities(start: str, end: str, db=Depends(get_db)):
         WHERE start_date >= :start AND start_date < :end
         ORDER BY start_date DESC
     """)
-
     rows = db.execute(q, {"start": start_d, "end": end_excl}).mappings().all()
     return rows
 
 
+
 @app.get("/stats/summary")
-def stats_summary(start: str, end: str):
-    from sqlalchemy import text
-    db_gen = get_db()
-    db = next(db_gen)  # obtener la sesión del generator
-    try:
-        q = text("""
-            SELECT
-              COUNT(*) AS n,
-              COALESCE(SUM(distance_m),0) AS dist_m,
-              COALESCE(SUM(moving_time_s),0) AS time_s,
-              COALESCE(SUM(total_elevation_gain_m),0) AS elev_m
-            FROM activities
-            WHERE start_date >= :start::timestamptz AND start_date < (:end::date + INTERVAL '1 day')
-        """)
-        row = db.execute(q, {"start": start, "end": end}).mappings().first()
-        return row
+def stats_summary(start: str, end: str, db=Depends(get_db)):
+    # start/end vienen como 'YYYY-MM-DD'
+    start_d = date.fromisoformat(start)
+    end_excl = date.fromisoformat(end) + timedelta(days=1)
+
+    q = sa.text("""
+        SELECT
+          COUNT(*) AS n,
+          COALESCE(SUM(distance_m),0) AS dist_m,
+          COALESCE(SUM(moving_time_s),0) AS time_s,
+          COALESCE(SUM(total_elevation_gain_m),0) AS elev_m
+        FROM activities
+        WHERE start_date >= :start AND start_date < :end
+    """)
+    row = db.execute(q, {"start": start_d, "end": end_excl}).mappings().first()
+    return row
+
     finally:
         db.close()
