@@ -1,33 +1,10 @@
 import os
 from datetime import date, datetime, timezone, timedelta
-
-def _to_utc_datetime(value) -> datetime:
-    """Acepta datetime/int/float/str (ISO/epoch) y devuelve datetime con tz=UTC."""
-    if value is None:
-        raise ValueError("datetime requerido")
-    if isinstance(value, datetime):
-        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
-    if isinstance(value, (int, float)):
-        return datetime.fromtimestamp(float(value), tz=timezone.utc)
-    if isinstance(value, str):
-        # admite ISO y 'Z'
-        return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
-    raise TypeError(f"Tipo no soportado para fecha: {type(value)}")
-
-def _as_utc(dt: datetime) -> datetime:
-    """Normaliza a datetime con tz=UTC (también si viene como epoch/str)."""
-    return _to_utc_datetime(dt)
-
-def _epoch_s(dt) -> int:
-    """Epoch seconds a partir de datetime/int/str, forzando UTC."""
-    return int(_to_utc_datetime(dt).timestamp())
-
-
 from typing import Optional, Dict, Any, List
 from urllib.parse import urlencode
 
-import sqlalchemy as sa
 import httpx
+import sqlalchemy as sa
 from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.responses import RedirectResponse, JSONResponse
 
@@ -38,6 +15,8 @@ from .storage import (
 
 app = FastAPI()
 
+# --- Configuración -----------------------------------------------------------
+
 STRAVA_CLIENT_ID = os.environ.get("STRAVA_CLIENT_ID")
 STRAVA_CLIENT_SECRET = os.environ.get("STRAVA_CLIENT_SECRET")
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN")
@@ -47,12 +26,36 @@ if not (STRAVA_CLIENT_ID and STRAVA_CLIENT_SECRET and ADMIN_TOKEN):
     raise RuntimeError("Faltan STRAVA_CLIENT_ID, STRAVA_CLIENT_SECRET o ADMIN_TOKEN en variables de entorno")
 
 
-# ---------- util ----------
 def _base_url(request: Request) -> str:
     if PUBLIC_URL:
         return PUBLIC_URL.rstrip("/")
     return f"{request.url.scheme}://{request.headers.get('host')}".rstrip("/")
 
+
+# --- Utilidades de fecha robustas -------------------------------------------
+
+def _to_utc_datetime(value) -> datetime:
+    """Acepta datetime/int/float/str (ISO/epoch) y devuelve datetime con tz=UTC."""
+    if value is None:
+        raise ValueError("datetime requerido")
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(float(value), tz=timezone.utc)
+    if isinstance(value, str):
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
+    raise TypeError(f"Tipo no soportado para fecha: {type(value)}")
+
+
+def _as_utc(dt) -> datetime:
+    return _to_utc_datetime(dt)
+
+
+def _epoch_s(dt) -> int:
+    return int(_to_utc_datetime(dt).timestamp())
+
+
+# --- Auth --------------------------------------------------------------------
 
 def _auth_admin_or_403(request: Request):
     auth = request.headers.get("Authorization", "")
@@ -63,9 +66,51 @@ def _auth_admin_or_403(request: Request):
         raise HTTPException(status_code=403, detail="Token inválido")
 
 
+# --- Strava helpers ----------------------------------------------------------
+
 def _get_strava_client(access_token: str) -> httpx.Client:
     headers = {"Authorization": f"Bearer {access_token}"}
     return httpx.Client(base_url="https://www.strava.com/api/v3", headers=headers, timeout=30)
+
+
+def _do_refresh(athlete_id: int) -> Dict[str, Any]:
+    tok = get_token(athlete_id)
+    if not tok:
+        raise HTTPException(status_code=404, detail=f"No hay token para athlete_id={athlete_id}")
+
+    token_url = "https://www.strava.com/oauth/token"
+    payload = {
+        "client_id": STRAVA_CLIENT_ID,
+        "client_secret": STRAVA_CLIENT_SECRET,
+        "grant_type": "refresh_token",
+        "refresh_token": tok.refresh_token,
+    }
+    with httpx.Client(timeout=30) as client:
+        res = client.post(token_url, data=payload)
+        res.raise_for_status()
+        data = res.json()
+
+    upsert_token(
+        athlete_id=athlete_id,
+        access_token=data["access_token"],
+        refresh_token=data["refresh_token"],
+        expires_at=int(data["expires_at"]),  # epoch
+        scope=",".join(data.get("scope", [])) if isinstance(data.get("scope"), list) else (data.get("scope") or getattr(tok, "scope", "")),
+    )
+    return data
+
+
+def _ensure_valid_access_token(athlete_id: int) -> str:
+    tok = get_token(athlete_id)
+    if not tok:
+        raise HTTPException(status_code=404, detail=f"No hay token para athlete_id={athlete_id}")
+
+    now_s = int(datetime.now(timezone.utc).timestamp())
+    expires_s = _epoch_s(tok.expires_at)  # soporta int/datetime/str
+    if expires_s <= now_s + 60:
+        _do_refresh(athlete_id)
+        tok = get_token(athlete_id)
+    return tok.access_token
 
 
 def _epoch_n_days_ago(days: int) -> int:
@@ -73,7 +118,44 @@ def _epoch_n_days_ago(days: int) -> int:
     return int(dt.timestamp())
 
 
-# ---------- OAuth ----------
+def _fetch_activities_since(access_token: str, after_epoch: int) -> int:
+    """
+    Descarga actividades desde 'after_epoch' y las guarda.
+    Devuelve cuántas se guardaron/actualizaron.
+    """
+    saved = 0
+    with _get_strava_client(access_token) as client:
+        page = 1
+        per_page = 200
+        while True:
+            resp = client.get("/athlete/activities", params={"after": after_epoch, "page": page, "per_page": per_page})
+            resp.raise_for_status()
+            items: List[Dict[str, Any]] = resp.json()
+            if not items:
+                break
+            for act in items:
+                save_or_update_activity(act)
+                saved += 1
+            if len(items) < per_page:
+                break
+            page += 1
+    return saved
+
+
+# --- Rutas -------------------------------------------------------------------
+
+@app.get("/")
+def root():
+    return {"ok": True, "message": "Strava GPT backend activo"}
+
+
+@app.get("/admin/health")
+def admin_health(request: Request, db=Depends(get_db)):
+    _auth_admin_or_403(request)
+    # Si se inyecta la sesión sin error, consideramos DB OK.
+    return {"ok": True, "db": True}
+
+
 @app.get("/oauth/start")
 def oauth_start(request: Request):
     redirect_uri = _base_url(request) + "/oauth/callback"
@@ -111,68 +193,20 @@ def oauth_callback(request: Request, code: Optional[str] = None, error: Optional
         data = res.json()
 
     athlete_id = int(data["athlete"]["id"])
+    access_token = data["access_token"]
+    refresh_token = data["refresh_token"]
+    expires_at = int(data["expires_at"])  # epoch
+    scope = ",".join(data.get("scope", [])) if isinstance(data.get("scope"), list) else (data.get("scope") or "")
+
     upsert_token(
         athlete_id=athlete_id,
-        access_token=data["access_token"],
-        refresh_token=data["refresh_token"],
-        expires_at=int(data["expires_at"]),
-        scope=",".join(data.get("scope", [])) if isinstance(data.get("scope"), list) else (data.get("scope") or ""),
+        access_token=access_token,
+        refresh_token=refresh_token,
+        expires_at=expires_at,
+        scope=scope,
     )
 
     return JSONResponse({"detail": "Autorización correcta. Ya puedes usar el GPT.", "athlete_id": athlete_id})
-
-
-# ---------- Tokens ----------
-def _do_refresh(athlete_id: int) -> Dict[str, Any]:
-    tok = get_token(athlete_id)
-    if not tok:
-        raise HTTPException(status_code=404, detail=f"No hay token para athlete_id={athlete_id}")
-
-    token_url = "https://www.strava.com/oauth/token"
-    payload = {
-        "client_id": STRAVA_CLIENT_ID,
-        "client_secret": STRAVA_CLIENT_SECRET,
-        "grant_type": "refresh_token",
-        "refresh_token": tok.refresh_token,
-    }
-    with httpx.Client(timeout=30) as client:
-        res = client.post(token_url, data=payload)
-        # Si el refresh falla, Strava devuelve 400 invalid_grant
-        res.raise_for_status()
-        data = res.json()
-
-    upsert_token(
-        athlete_id=athlete_id,
-        access_token=data["access_token"],
-        refresh_token=data["refresh_token"],
-        expires_at=int(data["expires_at"]),
-        scope=",".join(data.get("scope", [])) if isinstance(data.get("scope"), list) else (data.get("scope") or getattr(tok, "scope", "")),
-    )
-    return data
-
-
-def _ensure_valid_access_token(athlete_id: int) -> str:
-    tok = get_token(athlete_id)
-    if not tok:
-        raise HTTPException(status_code=404, detail=f"No hay token para athlete_id={athlete_id}")
-
-    now_s = int(datetime.now(timezone.utc).timestamp())
-    expires_s = _epoch_s(tok.expires_at)  # <- ahora acepta int/datetime/str
-    if expires_s <= now_s + 60:
-        _do_refresh(athlete_id)
-        tok = get_token(athlete_id)
-    return tok.access_token
-
-
-
-@app.get("/admin/health")
-def admin_health(db=Depends(get_db)):
-    try:
-        # simple ping a la DB
-        list(db.execute(sa.text("SELECT 1")))
-        return {"ok": True, "db": True}
-    except Exception:
-        return {"ok": False, "db": False}
 
 
 @app.get("/admin/token-info")
@@ -201,8 +235,6 @@ def token_info(request: Request, athlete_id: Optional[int] = None):
     }
 
 
-
-
 @app.post("/admin/refresh-token")
 def refresh_token(request: Request, athlete_id: Optional[int] = None):
     _auth_admin_or_403(request)
@@ -216,51 +248,28 @@ def refresh_token(request: Request, athlete_id: Optional[int] = None):
         "athlete_id": athlete_id,
         "refreshed": True,
         "expires_at": int(data["expires_at"]),
-        "access_token_tail": data["access_token"][-6:],
+        "access_token_tail": (data.get("access_token") or "")[-6:],
     }
-
-
-# ---------- Importar actividades ----------
-def _fetch_activities_since(access_token: str, after_epoch: int) -> int:
-    saved = 0
-    with _get_strava_client(access_token) as client:
-        page = 1
-        per_page = 200
-        while True:
-            resp = client.get("/athlete/activities", params={"after": after_epoch, "page": page, "per_page": per_page})
-            resp.raise_for_status()
-            items: List[Dict[str, Any]] = resp.json()
-            if not items:
-                break
-            for act in items:
-                save_or_update_activity(act)
-                saved += 1
-            if len(items) < per_page:
-                break
-            page += 1
-    return saved
 
 
 @app.post("/admin/initial-import")
 def initial_import(request: Request, days: int = 365, athlete_id: Optional[int] = None):
     _auth_admin_or_403(request)
-    if not athlete_id:
-        candidate = get_any_athlete_id()
-        if not candidate:
-            raise HTTPException(status_code=404, detail="No hay ningún atleta autorizado todavía")
-        athlete_id = candidate
 
-    # asegura token válido
+    if not athlete_id:
+        athlete_id = get_any_athlete_id()
+        if not athlete_id:
+            raise HTTPException(status_code=404, detail="No hay ningún atleta autorizado todavía")
+
     access_token = _ensure_valid_access_token(athlete_id)
     after_epoch = _epoch_n_days_ago(days)
     count = _fetch_activities_since(access_token, after_epoch)
     return {"imported": count, "athlete_id": athlete_id, "since_epoch": after_epoch}
 
 
-# ---------- Consultas de datos ----------
 @app.get("/activities")
 def list_activities(start: str, end: str, db=Depends(get_db)):
-    start_d = date.fromisoformat(start)
+    start_d = date.fromisoformat(start)                 # p.ej. 2025-05-01
     end_excl = date.fromisoformat(end) + timedelta(days=1)
 
     q = sa.text("""
@@ -274,10 +283,8 @@ def list_activities(start: str, end: str, db=Depends(get_db)):
     return rows
 
 
-
 @app.get("/stats/summary")
 def stats_summary(start: str, end: str, db=Depends(get_db)):
-    # start/end vienen como 'YYYY-MM-DD'
     start_d = date.fromisoformat(start)
     end_excl = date.fromisoformat(end) + timedelta(days=1)
 
@@ -292,6 +299,3 @@ def stats_summary(start: str, end: str, db=Depends(get_db)):
     """)
     row = db.execute(q, {"start": start_d, "end": end_excl}).mappings().first()
     return row
-
-    finally:
-        db.close()
