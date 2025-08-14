@@ -1,5 +1,16 @@
 import os
 from datetime import date, datetime, timezone, timedelta
+
+def _as_utc(dt: datetime) -> datetime:
+    """Devuelve dt con tz=UTC (si viene naive le pone UTC)."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+def _epoch_s(dt: datetime) -> int:
+    """Epoch seconds de un datetime (lo fuerza a UTC)."""
+    return int(_as_utc(dt).timestamp())
+
 from typing import Optional, Dict, Any, List
 from urllib.parse import urlencode
 
@@ -134,11 +145,11 @@ def _ensure_valid_access_token(athlete_id: int) -> str:
         raise HTTPException(status_code=404, detail=f"No hay token para athlete_id={athlete_id}")
 
     now_s = int(datetime.now(timezone.utc).timestamp())
-    expires_s = int(tok.expires_at.timestamp())
+    expires_s = _epoch_s(tok.expires_at)  # <-- robusto a naive
     # refresca si faltan <= 60s
     if expires_s <= now_s + 60:
         _do_refresh(athlete_id)
-        tok = get_token(athlete_id)  # recargar
+        tok = get_token(athlete_id)
     return tok.access_token
 
 
@@ -164,17 +175,19 @@ def token_info(request: Request, athlete_id: Optional[int] = None):
     if not tok:
         raise HTTPException(status_code=404, detail=f"No hay token para athlete_id={athlete_id}")
 
-    now = datetime.now(timezone.utc)
-    exp = tok.expires_at
+    now_utc = datetime.now(timezone.utc)
+    exp_utc = _as_utc(tok.expires_at)
+
     return {
         "athlete_id": athlete_id,
-        "expires_at_epoch": int(exp.timestamp()),
-        "expires_at_iso": exp.isoformat(),
-        "seconds_left": int((exp - now).total_seconds()),
-        "is_expired": exp <= now,
+        "expires_at_epoch": int(exp_utc.timestamp()),
+        "expires_at_iso": exp_utc.isoformat(),
+        "seconds_left": int((exp_utc - now_utc).total_seconds()),
+        "is_expired": exp_utc <= now_utc,
         "access_token_tail": tok.access_token[-6:],
         "scope": tok.scope or "",
     }
+
 
 
 @app.post("/admin/refresh-token")
