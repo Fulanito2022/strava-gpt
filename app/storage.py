@@ -1,3 +1,5 @@
+# app/storage.py
+
 import os
 from typing import Optional, Dict, Any
 from datetime import datetime, timezone
@@ -33,8 +35,8 @@ class Token(Base):
     athlete_id = sa.Column(sa.BigInteger, primary_key=True)
     access_token = sa.Column(sa.String, nullable=False)
     refresh_token = sa.Column(sa.String, nullable=False)
-    # Importante: timestamptz
-    expires_at = sa.Column(sa.DateTime(timezone=True), nullable=False, index=True)
+    # IMPORTANTE: en la BD es BIGINT (epoch segundos)
+    expires_at = sa.Column(sa.BigInteger, nullable=False, index=True)
     scope = sa.Column(sa.String, nullable=False, default="")
 
 
@@ -62,17 +64,25 @@ class Activity(Base):
 # Crea las tablas si no existen (no migra tipos existentes)
 Base.metadata.create_all(bind=engine)
 
-
 # --- Helpers ----------------------------------------------------------------
 
-def get_db():
-    """Dependency de FastAPI: yield Session y cierra al final."""
+def get_db() -> Session:
+    """
+    Devuelve una sesión de BD (estilo imperativo).
+    Si la usas, acuérdate de hacer db.close() cuando termines.
+    """
+    return SessionLocal()
+
+def get_db_dep():
+    """
+    Dependencia para FastAPI (cierre automático).
+    Úsala como: db=Depends(get_db_dep)
+    """
     db = SessionLocal()
     try:
         yield db
     finally:
         db.close()
-
 
 def _to_utc_datetime(value) -> datetime:
     """Convierte epoch/int/str/datetime a datetime con tz=UTC."""
@@ -87,18 +97,42 @@ def _to_utc_datetime(value) -> datetime:
         return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
     raise TypeError(f"Tipo no soportado para fecha: {type(value)}")
 
+def _to_epoch_seconds(value) -> int:
+    """
+    Convierte int/float/datetime/str a epoch (segundos) como int.
+    """
+    if value is None:
+        raise ValueError("expires_at requerido")
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, datetime):
+        dt = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp())
+    if isinstance(value, str):
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            dt = dt.astimezone(timezone.utc)
+        return int(dt.timestamp())
+    # último recurso: intenta castear
+    return int(value)
 
 # --- API de acceso ----------------------------------------------------------
 
 def get_token(athlete_id: int) -> Optional[Token]:
-    with SessionLocal() as db:
+    db = SessionLocal()
+    try:
         return db.get(Token, athlete_id)
-
+    finally:
+        db.close()
 
 def get_any_athlete_id() -> Optional[int]:
-    with SessionLocal() as db:
+    db = SessionLocal()
+    try:
         return db.query(Token.athlete_id).order_by(Token.athlete_id.asc()).limit(1).scalar()
-
+    finally:
+        db.close()
 
 def upsert_token(
     *,
@@ -108,26 +142,31 @@ def upsert_token(
     expires_at,  # puede venir como epoch/int o datetime/str
     scope: str = "",
 ) -> None:
-    exp_dt = _to_utc_datetime(expires_at)
+    """
+    Guarda/actualiza el token. 'expires_at' se almacena SIEMPRE como epoch (BIGINT).
+    """
+    expires_epoch = _to_epoch_seconds(expires_at)
 
-    with SessionLocal() as db:
+    db = SessionLocal()
+    try:
         tok = db.get(Token, athlete_id)
         if tok:
             tok.access_token = access_token
             tok.refresh_token = refresh_token
-            tok.expires_at = exp_dt
+            tok.expires_at = expires_epoch
             tok.scope = scope or ""
         else:
             tok = Token(
                 athlete_id=athlete_id,
                 access_token=access_token,
                 refresh_token=refresh_token,
-                expires_at=exp_dt,
+                expires_at=expires_epoch,
                 scope=scope or "",
             )
             db.add(tok)
         db.commit()
-
+    finally:
+        db.close()
 
 def save_or_update_activity(act: Dict[str, Any], db: Optional[Session] = None) -> None:
     """
